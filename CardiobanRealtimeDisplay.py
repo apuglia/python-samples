@@ -4,6 +4,7 @@ import threading
 import time
 from collections import deque
 import numpy as np
+from scipy import signal
 
 # Platform-specific library loading (same as other examples)
 osDic = {
@@ -42,16 +43,18 @@ except ImportError:
 
 
 class CardiobanRealtimeDevice(plux.SignalsDev):
-    def __init__(self, address, channels=1, buffer_size=1000, display_mode='both'):
+    def __init__(self, address, channels=1, buffer_size=1000, display_mode='both', enable_filters=True):
         plux.MemoryDev.__init__(address)
         self.channels = channels
         self.frequency = 0
         self.running = False
         self.display_mode = display_mode  # 'console', 'plot', 'both'
+        self.enable_filters = enable_filters
         
         # Data buffering
         self.buffer_size = buffer_size
         self.data_buffers = [deque(maxlen=buffer_size) for _ in range(channels)]
+        self.filtered_buffers = [deque(maxlen=buffer_size) for _ in range(channels)]
         self.time_buffer = deque(maxlen=buffer_size)
         self.sample_count = 0
         self.start_time = 0
@@ -63,31 +66,105 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
         self.min_values = [float('inf')] * channels
         self.max_values = [float('-inf')] * channels
         self.last_values = [0] * channels
+        
+        # Filter states
+        self.filter_initialized = False
+        self.highpass_zi = None
+        self.lowpass_zi = None
+        self.notch_zi = None
+
+    def initialize_filters(self, frequency):
+        """Initialize ECG signal filters"""
+        if not self.enable_filters:
+            return
+            
+        # High-pass filter: removes baseline wander (0.5 Hz cutoff)
+        self.highpass_sos = signal.butter(4, 0.5, btype='high', fs=frequency, output='sos')
+        self.highpass_zi = [signal.sosfilt_zi(self.highpass_sos) for _ in range(self.channels)]
+        
+        # Low-pass filter: removes high-frequency noise (40 Hz cutoff)
+        self.lowpass_sos = signal.butter(4, 40, btype='low', fs=frequency, output='sos')
+        self.lowpass_zi = [signal.sosfilt_zi(self.lowpass_sos) for _ in range(self.channels)]
+        
+        # Notch filter: removes 50 Hz powerline interference
+        b_notch, a_notch = signal.iirnotch(50, 30, fs=frequency)
+        self.notch_sos = signal.tf2sos(b_notch, a_notch)
+        self.notch_zi = [signal.sosfilt_zi(self.notch_sos) for _ in range(self.channels)]
+        
+        self.filter_initialized = True
+        print("ECG filters initialized:")
+        print("  - High-pass: 0.5 Hz (baseline wander removal)")
+        print("  - Low-pass: 40 Hz (noise reduction)")
+        print("  - Notch: 50 Hz (powerline interference removal)")
+
+    def apply_filters(self, data):
+        """Apply real-time ECG filters to data"""
+        if not self.enable_filters or not self.filter_initialized:
+            return data
+            
+        filtered_data = []
+        for i, value in enumerate(data[:self.channels]):
+            # Convert to float array for filtering
+            x = np.array([float(value)])
+            
+            # Apply high-pass filter
+            x, self.highpass_zi[i] = signal.sosfilt(self.highpass_sos, x, zi=self.highpass_zi[i])
+            
+            # Apply low-pass filter
+            x, self.lowpass_zi[i] = signal.sosfilt(self.lowpass_sos, x, zi=self.lowpass_zi[i])
+            
+            # Apply notch filter
+            x, self.notch_zi[i] = signal.sosfilt(self.notch_sos, x, zi=self.notch_zi[i])
+            
+            filtered_data.append(x[0])
+            
+        return filtered_data
 
     def onRawFrame(self, nSeq, data):
         current_time = time.time() - self.start_time
+        
+        # Apply filters to the data
+        filtered_data = self.apply_filters(data)
         
         with self.data_lock:
             # Store data in buffers
             self.time_buffer.append(current_time)
             
             for i in range(min(len(data), self.channels)):
-                value = data[i]
-                self.data_buffers[i].append(value)
-                self.last_values[i] = value
+                # Store raw data
+                raw_value = data[i]
+                self.data_buffers[i].append(raw_value)
                 
-                # Update statistics
-                if value < self.min_values[i]:
-                    self.min_values[i] = value
-                if value > self.max_values[i]:
-                    self.max_values[i] = value
+                # Store filtered data
+                if self.enable_filters and filtered_data:
+                    filtered_value = filtered_data[i]
+                    self.filtered_buffers[i].append(filtered_value)
+                    self.last_values[i] = filtered_value
+                    
+                    # Update statistics with filtered data
+                    if filtered_value < self.min_values[i]:
+                        self.min_values[i] = filtered_value
+                    if filtered_value > self.max_values[i]:
+                        self.max_values[i] = filtered_value
+                else:
+                    # Use raw data if no filtering
+                    self.filtered_buffers[i].append(raw_value)
+                    self.last_values[i] = raw_value
+                    
+                    if raw_value < self.min_values[i]:
+                        self.min_values[i] = raw_value
+                    if raw_value > self.max_values[i]:
+                        self.max_values[i] = raw_value
             
             self.sample_count = nSeq
         
         # Console output
         if self.display_mode in ['console', 'both']:
             if nSeq % 100 == 0:  # Print every 100 samples to avoid overwhelming output
-                print(f"Sample {nSeq:6d} | Time: {current_time:7.2f}s | Data: {data[:self.channels]}")
+                if self.enable_filters and filtered_data:
+                    print(f"Sample {nSeq:6d} | Time: {current_time:7.2f}s | Raw: {data[:self.channels]} | Filtered: {[f'{x:.1f}' for x in filtered_data[:self.channels]]}")
+                else:
+                    print(f"Sample {nSeq:6d} | Time: {current_time:7.2f}s | Data: {data[:self.channels]}")
         
         return not self.running
 
@@ -95,6 +172,9 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
         self.frequency = frequency
         self.running = True
         self.start_time = time.time()
+        
+        # Initialize filters
+        self.initialize_filters(frequency)
         
         # Calculate channel code based on number of channels
         channel_codes = {1: 0x01, 2: 0x03, 3: 0x07, 4: 0x0F, 
@@ -105,6 +185,7 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
         print(f"Channels: {self.channels} (code: 0x{code:02X})")
         print(f"Frequency: {frequency} Hz")
         print(f"Duration: {'Continuous' if duration is None else f'{duration}s'}")
+        print(f"Filtering: {'Enabled' if self.enable_filters else 'Disabled'}")
         print("-" * 50)
         
         # Start the device
@@ -145,52 +226,123 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
     def get_plot_data(self):
         with self.data_lock:
             if len(self.time_buffer) == 0:
-                return [], [[] for _ in range(self.channels)]
+                return [], [[] for _ in range(self.channels)], [[] for _ in range(self.channels)]
             
             times = list(self.time_buffer)
-            data_arrays = [list(buffer) for buffer in self.data_buffers]
-            return times, data_arrays
+            raw_data_arrays = [list(buffer) for buffer in self.data_buffers]
+            filtered_data_arrays = [list(buffer) for buffer in self.filtered_buffers]
+            return times, raw_data_arrays, filtered_data_arrays
 
 
 class RealtimePlotter:
-    def __init__(self, device, update_interval=50):
+    def __init__(self, device, update_interval=50, show_both=False):
         self.device = device
         self.update_interval = update_interval
+        self.show_both = show_both
         
-        # Create the plot
-        self.fig, self.axes = plt.subplots(device.channels, 1, figsize=(12, 3*device.channels))
-        if device.channels == 1:
-            self.axes = [self.axes]
+        # Create subplots - if showing both raw and filtered, create 2 rows per channel
+        if show_both and device.enable_filters:
+            rows = device.channels * 2
+            self.fig, self.axes = plt.subplots(rows, 1, figsize=(12, 2*rows))
+            if rows == 1:
+                self.axes = [self.axes]
+        else:
+            self.fig, self.axes = plt.subplots(device.channels, 1, figsize=(12, 3*device.channels))
+            if device.channels == 1:
+                self.axes = [self.axes]
         
-        self.lines = []
-        for i, ax in enumerate(self.axes):
-            line, = ax.plot([], [], 'b-', linewidth=1)
-            self.lines.append(line)
-            ax.set_title(f'Channel {i+1} - Cardioban Real-time Data')
-            ax.set_xlabel('Time (s)')
-            ax.set_ylabel('Signal Value')
-            ax.grid(True, alpha=0.3)
+        self.raw_lines = []
+        self.filtered_lines = []
+        
+        if show_both and device.enable_filters:
+            # Create lines for both raw and filtered data
+            for i in range(device.channels):
+                # Raw data subplot
+                raw_ax = self.axes[i*2]
+                raw_line, = raw_ax.plot([], [], 'r-', linewidth=1, label='Raw')
+                self.raw_lines.append(raw_line)
+                raw_ax.set_title(f'Channel {i+1} - Raw ECG Data')
+                raw_ax.set_ylabel('Raw Signal')
+                raw_ax.grid(True, alpha=0.3)
+                raw_ax.legend()
+                
+                # Filtered data subplot
+                filtered_ax = self.axes[i*2 + 1]
+                filtered_line, = filtered_ax.plot([], [], 'b-', linewidth=1, label='Filtered')
+                self.filtered_lines.append(filtered_line)
+                filtered_ax.set_title(f'Channel {i+1} - Filtered ECG Data')
+                filtered_ax.set_xlabel('Time (s)')
+                filtered_ax.set_ylabel('Filtered Signal')
+                filtered_ax.grid(True, alpha=0.3)
+                filtered_ax.legend()
+        else:
+            # Single plot per channel (raw or filtered based on device setting)
+            for i, ax in enumerate(self.axes):
+                if device.enable_filters:
+                    line, = ax.plot([], [], 'b-', linewidth=1, label='Filtered')
+                    self.filtered_lines.append(line)
+                    ax.set_title(f'Channel {i+1} - Filtered ECG Data')
+                else:
+                    line, = ax.plot([], [], 'r-', linewidth=1, label='Raw')
+                    self.raw_lines.append(line)
+                    ax.set_title(f'Channel {i+1} - Raw ECG Data')
+                ax.set_xlabel('Time (s)')
+                ax.set_ylabel('Signal Value')
+                ax.grid(True, alpha=0.3)
+                ax.legend()
         
         plt.tight_layout()
 
     def update_plot(self, frame):
-        times, data_arrays = self.device.get_plot_data()
+        times, raw_data_arrays, filtered_data_arrays = self.device.get_plot_data()
         
         if len(times) > 1:
-            for i, (line, data) in enumerate(zip(self.lines, data_arrays)):
-                if len(data) > 0:
-                    line.set_data(times[:len(data)], data)
+            if self.show_both and self.device.enable_filters:
+                # Update both raw and filtered plots
+                all_lines = []
+                for i in range(self.device.channels):
+                    # Update raw data
+                    if len(raw_data_arrays[i]) > 0:
+                        self.raw_lines[i].set_data(times[:len(raw_data_arrays[i])], raw_data_arrays[i])
+                        raw_ax = self.axes[i*2]
+                        if len(times) > 0 and len(raw_data_arrays[i]) > 0:
+                            raw_ax.set_xlim(min(times), max(times))
+                            if len(raw_data_arrays[i]) > 1:
+                                data_min, data_max = min(raw_data_arrays[i]), max(raw_data_arrays[i])
+                                margin = (data_max - data_min) * 0.1
+                                raw_ax.set_ylim(data_min - margin, data_max + margin)
+                        all_lines.append(self.raw_lines[i])
                     
-                    # Auto-scale axes
-                    ax = self.axes[i]
-                    if len(times) > 0 and len(data) > 0:
-                        ax.set_xlim(min(times), max(times))
-                        if len(data) > 1:
-                            data_min, data_max = min(data), max(data)
-                            margin = (data_max - data_min) * 0.1
-                            ax.set_ylim(data_min - margin, data_max + margin)
+                    # Update filtered data
+                    if len(filtered_data_arrays[i]) > 0:
+                        self.filtered_lines[i].set_data(times[:len(filtered_data_arrays[i])], filtered_data_arrays[i])
+                        filtered_ax = self.axes[i*2 + 1]
+                        if len(times) > 0 and len(filtered_data_arrays[i]) > 0:
+                            filtered_ax.set_xlim(min(times), max(times))
+                            if len(filtered_data_arrays[i]) > 1:
+                                data_min, data_max = min(filtered_data_arrays[i]), max(filtered_data_arrays[i])
+                                margin = (data_max - data_min) * 0.1
+                                filtered_ax.set_ylim(data_min - margin, data_max + margin)
+                        all_lines.append(self.filtered_lines[i])
+                return all_lines
+            else:
+                # Single plot mode - show either raw or filtered
+                lines_to_update = self.filtered_lines if self.device.enable_filters else self.raw_lines
+                data_to_use = filtered_data_arrays if self.device.enable_filters else raw_data_arrays
+                
+                for i, (line, data) in enumerate(zip(lines_to_update, data_to_use)):
+                    if len(data) > 0:
+                        line.set_data(times[:len(data)], data)
+                        ax = self.axes[i]
+                        if len(times) > 0 and len(data) > 0:
+                            ax.set_xlim(min(times), max(times))
+                            if len(data) > 1:
+                                data_min, data_max = min(data), max(data)
+                                margin = (data_max - data_min) * 0.1
+                                ax.set_ylim(data_min - margin, data_max + margin)
+                return lines_to_update
         
-        return self.lines
+        return []
 
     def start_animation(self):
         self.ani = animation.FuncAnimation(
@@ -206,6 +358,7 @@ def main():
     frequency = 1000  # Sampling frequency in Hz
     duration = None  # Duration in seconds (None for continuous)
     display_mode = 'both'  # 'console', 'plot', 'both'
+    enable_filters = True  # Enable ECG filtering by default
     
     # Parse command line arguments
     if len(sys.argv) > 1:
@@ -218,6 +371,8 @@ def main():
         duration = float(sys.argv[4])
     if len(sys.argv) > 5:
         display_mode = sys.argv[5]
+    if len(sys.argv) > 6:
+        enable_filters = sys.argv[6].lower() in ['true', '1', 'yes', 'on']
     
     # Validate parameters
     if channels < 1 or channels > 8:
@@ -230,7 +385,7 @@ def main():
         print(f"Maximum recommended: {max_freq.get(channels, 1000)} Hz")
     
     # Create device
-    device = CardiobanRealtimeDevice(address, channels=channels, display_mode=display_mode)
+    device = CardiobanRealtimeDevice(address, channels=channels, display_mode=display_mode, enable_filters=enable_filters)
     
     try:
         # Start acquisition
@@ -238,7 +393,9 @@ def main():
         
         # Start plotting if matplotlib is available and requested
         if HAS_MATPLOTLIB and display_mode in ['plot', 'both']:
-            plotter = RealtimePlotter(device)
+            # Show both raw and filtered plots if filters are enabled
+            show_both = enable_filters
+            plotter = RealtimePlotter(device, show_both=show_both)
             plotter.start_animation()
         else:
             # Wait for acquisition to complete
@@ -256,9 +413,10 @@ def main():
 
 if __name__ == "__main__":
     print("Cardioban Real-time Data Display")
-    print("Usage: python CardiobanRealtimeDisplay.py [address] [channels] [frequency] [duration] [display_mode]")
-    print("Example: python CardiobanRealtimeDisplay.py BTH00:07:80:4D:2E:76 2 1000 30 both")
+    print("Usage: python CardiobanRealtimeDisplay.py [address] [channels] [frequency] [duration] [display_mode] [filters]")
+    print("Example: python CardiobanRealtimeDisplay.py BTH00:07:80:4D:2E:76 2 1000 30 both true")
     print("Display modes: 'console', 'plot', 'both'")
+    print("Filters: 'true'/'false' - Enable/disable ECG filtering")
     print("Press Ctrl+C to stop acquisition\n")
     
     main()
