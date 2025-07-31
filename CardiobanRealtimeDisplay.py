@@ -5,6 +5,7 @@ import time
 from collections import deque
 import numpy as np
 from scipy import signal
+from ecg_analysis import ECGQualityAnalyzer
 
 # Platform-specific library loading (same as other examples)
 osDic = {
@@ -72,6 +73,9 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
         self.highpass_zi = None
         self.lowpass_zi = None
         self.notch_zi = None
+        
+        # ECG Quality Analyzer (will be initialized with proper frequency later)
+        self.quality_analyzer = None
 
     def initialize_filters(self, frequency):
         """Initialize ECG signal filters"""
@@ -158,6 +162,17 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
             
             self.sample_count = nSeq
         
+        # Add samples to quality analyzer (use filtered data if available)
+        if self.quality_analyzer is not None:
+            for i in range(min(len(data), self.channels)):
+                analysis_value = filtered_data[i] if (self.enable_filters and filtered_data) else data[i]
+                self.quality_analyzer.add_sample(analysis_value, current_time)
+                
+                # Debug: Print first few samples to verify data flow
+                if nSeq < 5:
+                    print(f"DEBUG: Adding sample {nSeq}: value={analysis_value}, time={current_time}")
+                    print(f"DEBUG: Buffer size now: {len(self.quality_analyzer.signal_buffer)}")
+        
         # Console output
         if self.display_mode in ['console', 'both']:
             if nSeq % 100 == 0:  # Print every 100 samples to avoid overwhelming output
@@ -165,6 +180,11 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
                     print(f"Sample {nSeq:6d} | Time: {current_time:7.2f}s | Raw: {data[:self.channels]} | Filtered: {[f'{x:.1f}' for x in filtered_data[:self.channels]]}")
                 else:
                     print(f"Sample {nSeq:6d} | Time: {current_time:7.2f}s | Data: {data[:self.channels]}")
+                
+                # Show quality metrics every 500 samples
+                if nSeq % 500 == 0 and self.quality_analyzer is not None:
+                    quality_str = self.quality_analyzer.get_quality_string()
+                    print(f"         >>> {quality_str}")
         
         return not self.running
 
@@ -175,6 +195,9 @@ class CardiobanRealtimeDevice(plux.SignalsDev):
         
         # Initialize filters
         self.initialize_filters(frequency)
+        
+        # Initialize quality analyzer
+        self.quality_analyzer = ECGQualityAnalyzer(sampling_rate=frequency, buffer_size=self.buffer_size)
         
         # Calculate channel code based on number of channels
         channel_codes = {1: 0x01, 2: 0x03, 3: 0x07, 4: 0x0F, 
@@ -253,6 +276,7 @@ class RealtimePlotter:
         
         self.raw_lines = []
         self.filtered_lines = []
+        self.quality_text = None
         
         if show_both and device.enable_filters:
             # Create lines for both raw and filtered data
@@ -291,7 +315,15 @@ class RealtimePlotter:
                 ax.grid(True, alpha=0.3)
                 ax.legend()
         
+        # Add quality metrics text box
+        if device.enable_filters:
+            # Add text box for quality metrics at the top
+            self.quality_text = self.fig.text(0.02, 0.98, 'Quality Metrics: Initializing...', 
+                                            fontsize=10, verticalalignment='top',
+                                            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+        
         plt.tight_layout()
+        plt.subplots_adjust(top=0.95)  # Make room for quality text
 
     def update_plot(self, frame):
         times, raw_data_arrays, filtered_data_arrays = self.device.get_plot_data()
@@ -342,6 +374,46 @@ class RealtimePlotter:
                                 ax.set_ylim(data_min - margin, data_max + margin)
                 return lines_to_update
         
+        # Update quality metrics text
+        if self.quality_text and self.device.quality_analyzer:
+            try:
+                metrics = self.device.quality_analyzer.get_quality_metrics()
+                
+                # Check if we have enough data for meaningful metrics
+                if len(self.device.quality_analyzer.signal_buffer) < 100:
+                    quality_text = "📊 SIGNAL QUALITY: Collecting data... 📈"
+                    color = 'lightgray'
+                else:
+                    # Create quality level indicator
+                    quality_level = "Poor"
+                    color = 'lightcoral'
+                    if metrics['quality_score'] > 80:
+                        quality_level = "Excellent"
+                        color = 'lightgreen'
+                    elif metrics['quality_score'] > 60:
+                        quality_level = "Good"
+                        color = 'lightblue'
+                    elif metrics['quality_score'] > 40:
+                        quality_level = "Fair"
+                        color = 'lightyellow'
+                    
+                    # Format metrics text
+                    quality_text = (
+                        f"📊 SIGNAL QUALITY: {quality_level} ({metrics['quality_score']:.1f}/100)\n"
+                        f"🔊 SNR: {metrics['snr']:.1f} dB  |  "
+                        f"💓 Heart Rate: {metrics['heart_rate']:.1f} BPM  |  "
+                        f"🔄 HRV: {metrics['hrv']:.1f} ms\n"
+                        f"📈 QRS Correlation: {metrics['template_correlation']:.3f}  |  "
+                        f"🫀 QRS Count: {metrics['qrs_count']}"
+                    )
+                
+                self.quality_text.set_text(quality_text)
+                self.quality_text.set_bbox(dict(boxstyle='round', facecolor=color, alpha=0.8))
+            except Exception as e:
+                # Fallback if there's an error
+                self.quality_text.set_text(f"📊 SIGNAL QUALITY: Starting analysis... (samples: {len(times)})")
+                self.quality_text.set_bbox(dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
         return []
 
     def start_animation(self):
@@ -355,7 +427,7 @@ def main():
     # Configuration
     address = "BTH00:07:80:4D:2E:76"  # Default Cardioban address
     channels = 1  # Number of channels to acquire
-    frequency = 1000  # Sampling frequency in Hz
+    frequency = 500  # Sampling frequency in Hz
     duration = None  # Duration in seconds (None for continuous)
     display_mode = 'both'  # 'console', 'plot', 'both'
     enable_filters = True  # Enable ECG filtering by default
